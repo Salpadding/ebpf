@@ -12,6 +12,17 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type bpfNetpacket struct {
+	IphLen    uint8
+	IpVer     uint8
+	TranProto uint8
+	_         [1]byte
+	SrcIp     uint32
+	DstIp     uint32
+	SrcPort   uint16
+	DstPort   uint16
+}
+
 // loadBpf returns the embedded CollectionSpec for bpf.
 func loadBpf() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_BpfBytes)
@@ -60,6 +71,7 @@ type bpfProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfMapSpecs struct {
+	Messages    *ebpf.MapSpec `ebpf:"messages"`
 	XdpStatsMap *ebpf.MapSpec `ebpf:"xdp_stats_map"`
 }
 
@@ -82,11 +94,13 @@ func (o *bpfObjects) Close() error {
 //
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfMaps struct {
+	Messages    *ebpf.Map `ebpf:"messages"`
 	XdpStatsMap *ebpf.Map `ebpf:"xdp_stats_map"`
 }
 
 func (m *bpfMaps) Close() error {
 	return _BpfClose(
+		m.Messages,
 		m.XdpStatsMap,
 	)
 }

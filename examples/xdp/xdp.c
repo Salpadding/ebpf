@@ -5,7 +5,20 @@
 
 char __license[] SEC("license") = "Dual MIT/GPL";
 
+struct netpacket {
+    u8 iph_len;
+    u8 ip_ver; // ip 版本
+    u8 tran_proto; // ip上层的协议
+    __be32 src_ip; // 源地址
+    __be32 dst_ip; // 目的地址
+    __be16 src_port; // 源端口
+    __be16 dst_port; // 目标端口
+};
+// Force emitting struct event into the ELF.
+const struct netpacket *unused __attribute__((unused));
+
 #define MAX_MAP_ENTRIES 16
+#define BUF_SIZE 32
 
 /* Define an LRU hash map for storing packet count by source IPv4 address */
 struct {
@@ -14,6 +27,17 @@ struct {
 	__type(key, __u32); // source IPv4 address
 	__type(value, __u32); // packet count
 } xdp_stats_map SEC(".maps");
+
+
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 1 << 24);
+} messages SEC(".maps");
+
+struct tran_h {
+    __be16 source;
+    __be16 dest;
+};
 
 /*
 Attempt to parse the IPv4 source address from the packet.
@@ -42,6 +66,31 @@ static __always_inline int parse_ip_src_addr(struct xdp_md *ctx, __u32 *ip_src_a
 
 	// Return the source IP address in network byte order.
 	*ip_src_addr = (__u32)(ip->saddr);
+
+    // 不是tcp 跳过
+    if(ip->protocol != 6) return 1;
+
+    struct tran_h* tcph = data + sizeof(struct ethhdr) + (ip->ihl * 4);
+    struct netpacket* packet = bpf_ringbuf_reserve(&messages, sizeof(struct netpacket), 0);
+
+    // 目标 ip = 192.168.1.33 目标端口 = 80 -> 把目标端口改写成 37700
+    // 源 ip = 192.168.1.33 源端口 = 37700 -> 把源端口改写成 80
+    if (packet) {
+        packet->iph_len = ip->ihl * 4;
+        packet->ip_ver = ip->version;
+        packet->src_ip = ip->saddr;
+        packet->dst_ip = ip->daddr;
+        packet->tran_proto = ip->protocol;
+        
+        if( ((u64) tcph)  + 4 <= (u64) data_end )  {
+            packet->src_port = tcph->source;
+            packet->dst_port = tcph->dest;
+        }
+
+        bpf_ringbuf_submit(packet, 0);
+    }
+
+
 	return 1;
 }
 

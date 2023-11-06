@@ -9,6 +9,9 @@
 package main
 
 import (
+	"bytes"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -19,10 +22,11 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/ringbuf"
+	_ "golang.org/x/sys/unix"
 )
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go bpf xdp.c -- -I../headers
-
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -type netpacket bpf xdp.c -- -I../headers
 func main() {
 	if len(os.Args) < 2 {
 		log.Fatalf("Please specify a network interface")
@@ -55,16 +59,18 @@ func main() {
 	log.Printf("Attached XDP program to iface %q (index %d)", iface.Name, iface.Index)
 	log.Printf("Press Ctrl-C to exit and remove the program")
 
+	loopRb(objs.Messages)
+
 	// Print the contents of the BPF hash map (source IP address -> packet count).
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
-		s, err := formatMapContents(objs.XdpStatsMap)
+		_, err := formatMapContents(objs.XdpStatsMap)
 		if err != nil {
-			log.Printf("Error reading map: %s", err)
+			//log.Printf("Error reading map: %s", err)
 			continue
 		}
-		log.Printf("Map contents:\n%s", s)
+		//log.Printf("Map contents:\n%s", s)
 	}
 }
 
@@ -81,4 +87,53 @@ func formatMapContents(m *ebpf.Map) (string, error) {
 		sb.WriteString(fmt.Sprintf("\t%s => %d\n", sourceIP, packetCount))
 	}
 	return sb.String(), iter.Err()
+}
+
+func loopRb(rb *ebpf.Map) {
+	// Open a ringbuf reader from userspace RINGBUF map described in the
+	// eBPF C program.
+	rd, err := ringbuf.NewReader(rb)
+	if err != nil {
+		log.Fatalf("opening ringbuf reader: %s", err)
+	}
+	defer rd.Close()
+
+	// Close the reader when the process receives a signal, which will exit
+	log.Println("Waiting for events..")
+
+	portMaps := make(map[int]int)
+
+	var netpacket bpfNetpacket
+
+	go func() {
+		ticker := time.NewTicker(3 * time.Second)
+		for range ticker.C {
+			for k, v := range portMaps {
+				fmt.Printf("%d -> %d\n", k, v)
+			}
+		}
+	}()
+
+	for {
+		record, err := rd.Read()
+		if err != nil {
+			if errors.Is(err, ringbuf.ErrClosed) {
+				log.Println("Received signal, exiting..")
+				return
+			}
+			log.Printf("reading from reader: %s", err)
+			continue
+		}
+
+		// Parse the ringbuf event entry into a bpfEvent structure.
+		if err := binary.Read(bytes.NewBuffer(record.RawSample), binary.BigEndian, &netpacket); err != nil {
+			log.Printf("parsing ringbuf event: %s", err)
+			log.Printf("src port = %d", netpacket.SrcPort)
+		} else {
+			var srcIp net.IP = make([]byte, 4)
+			binary.BigEndian.PutUint32(srcIp, netpacket.SrcIp)
+			portMaps[int(netpacket.SrcPort)] = int(netpacket.DstPort)
+		}
+
+	}
 }
